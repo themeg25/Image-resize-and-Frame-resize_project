@@ -1,0 +1,421 @@
+import io
+import logging
+import urllib.parse
+from pathlib import PurePosixPath
+
+import boto3
+import cv2
+import numpy as np
+from PIL import Image, ImageOps, UnidentifiedImageError
+
+# ============================================================
+# AWS CONFIGURATION
+# ============================================================
+
+s3 = boto3.client("s3")
+
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+BUCKET_NAME = "stylo-captain-bucket"
+INPUT_PREFIX = "Test-Original-Images/"
+
+# Keep these S3 output folder names.
+SQUARE_OUTPUT_PREFIX = "150*150/"
+RECTANGLE_OUTPUT_PREFIX = "200*400/"
+
+PROCESSED_METADATA_KEY = "image-resizer-processed"
+PROCESSED_METADATA_VALUE = "true"
+
+# ============================================================
+# OUTPUT SETTINGS
+# folder: (display width, display height, max_distortion)
+#
+# max_distortion:
+#   None -> NEVER cut. Whole image expands to fill the frame.
+#   0.15 -> allow up to 15% stretch; only if more is needed,
+#           cut the small extra part so the image is not squashed.
+# ============================================================
+
+OUTPUTS = {
+    SQUARE_OUTPUT_PREFIX: (150, 150, None),
+    RECTANGLE_OUTPUT_PREFIX: (400, 200, None),
+}
+
+# ============================================================
+# QUALITY SETTINGS
+# ============================================================
+
+# 3 = saved file has 3x pixels (450x450 and 1200x600), so the
+# image stays sharp when the user zooms. Same shape / ratio.
+# Set to 1 for the EXACT pixel size 150x150 / 400x200.
+OUTPUT_SCALE = 3
+
+# Used only when max_distortion is set and a small cut is needed.
+CROP_CENTER_X = 0.5
+CROP_CENTER_Y = 0.5
+
+MAX_SOURCE_WIDTH = 8000
+MAX_SOURCE_HEIGHT = 8000
+
+JPEG_QUALITY = 96
+KB = 1024
+
+
+# ============================================================
+# LAMBDA HANDLER
+# ============================================================
+
+def lambda_handler(event, context):
+    logger.info("IMAGE RESIZER STARTED")
+    results = []
+
+    try:
+        records = event.get("Records", [])
+
+        if records:
+            for record in records:
+                result = process_s3_record(record)
+                if result is not None:
+                    results.append(result)
+
+        elif event.get("mode") == "backfill":
+            results = backfill_existing_images()
+
+        else:
+            return {"statusCode": 200, "message": "Nothing to process"}
+
+        return {
+            "statusCode": 200,
+            "message": "Image processing completed",
+            "results": results,
+        }
+
+    except Exception:
+        logger.exception("IMAGE PROCESSING FAILED")
+        raise
+
+
+# ============================================================
+# PROCESS S3 UPLOAD EVENT
+# ============================================================
+
+def process_s3_record(record):
+    if record.get("eventSource") != "aws:s3":
+        return None
+
+    bucket = record["s3"]["bucket"]["name"]
+    source_key = urllib.parse.unquote_plus(record["s3"]["object"]["key"])
+
+    if bucket != BUCKET_NAME:
+        return {"input": source_key, "status": "ignored",
+                "reason": "Unexpected bucket"}
+
+    if not source_key.startswith(INPUT_PREFIX):
+        return {"input": source_key, "status": "ignored",
+                "reason": "Outside input folder"}
+
+    if source_key.endswith("/"):
+        return {"input": source_key, "status": "ignored",
+                "reason": "Folder placeholder"}
+
+    head = s3.head_object(Bucket=bucket, Key=source_key)
+    metadata = head.get("Metadata", {})
+
+    if metadata.get(PROCESSED_METADATA_KEY) == PROCESSED_METADATA_VALUE:
+        return {"input": source_key, "status": "ignored",
+                "reason": "Already processed"}
+
+    return process_image(bucket, source_key)
+
+
+# ============================================================
+# PROCESS ORIGINAL IMAGE
+# ============================================================
+
+def process_image(bucket, source_key):
+    logger.info("Processing original: %s", source_key)
+
+    response = s3.get_object(Bucket=bucket, Key=source_key)
+    original_data = response["Body"].read()
+
+    if not original_data:
+        return {"input": source_key, "status": "ignored",
+                "reason": "Empty image"}
+
+    original_size = len(original_data)
+
+    try:
+        with Image.open(io.BytesIO(original_data)) as check:
+            check.verify()
+
+        with Image.open(io.BytesIO(original_data)) as opened:
+            icc_profile = opened.info.get("icc_profile")
+            image = ImageOps.exif_transpose(opened)
+
+            if getattr(image, "is_animated", False):
+                image.seek(0)
+
+            image = image.copy()
+
+    except (UnidentifiedImageError, OSError) as exc:
+        logger.warning("Invalid image %s: %s", source_key, exc)
+        return {"input": source_key, "status": "ignored",
+                "reason": "Invalid or unsupported image"}
+
+    logger.info(
+        "Original: %s x %s; %.2f KB",
+        image.width, image.height, original_size / KB,
+    )
+
+    # No color / contrast changes -- original colors are kept.
+    image = convert_to_rgb(image)
+    image = limit_source_dimensions(image)
+    source_array = np.array(image)
+
+    outputs = []
+
+    for prefix, (display_w, display_h, max_distortion) in OUTPUTS.items():
+        target_w = display_w * OUTPUT_SCALE
+        target_h = display_h * OUTPUT_SCALE
+
+        output_image = fill_frame_no_cut(
+            source_array,
+            target_w,
+            target_h,
+            max_distortion=max_distortion,
+        )
+
+        output_data = encode_jpeg(output_image, icc_profile)
+
+        relative_key = source_key[len(INPUT_PREFIX):]
+        output_relative_key = str(
+            PurePosixPath(relative_key).with_suffix(".jpg")
+        )
+        output_key = f"{prefix}{output_relative_key}"
+
+        s3.put_object(
+            Bucket=bucket,
+            Key=output_key,
+            Body=output_data,
+            ContentType="image/jpeg",
+            Metadata={
+                PROCESSED_METADATA_KEY: PROCESSED_METADATA_VALUE,
+                "source-key": source_key[:512],
+            },
+        )
+
+        logger.info(
+            "Created %s | %s x %s | %.2f KB | max_distortion %s",
+            output_key, target_w, target_h,
+            len(output_data) / KB, max_distortion,
+        )
+
+        outputs.append({
+            "key": output_key,
+            "width": target_w,
+            "height": target_h,
+            "display_width": display_w,
+            "display_height": display_h,
+            "size_kb": round(len(output_data) / KB, 2),
+            "jpeg_quality": JPEG_QUALITY,
+        })
+
+    return {
+        "input": source_key,
+        "status": "processed",
+        "original_size_kb": round(original_size / KB, 2),
+        "outputs": outputs,
+        "message": "Original preserved; resized images created.",
+    }
+
+
+# ============================================================
+# NO-CUT FRAME FILL (used for BOTH 150x150 and 400x200)
+# The WHOLE image is expanded to fill the whole frame.
+# No borders, no shades, no empty space, nothing cut.
+# ============================================================
+
+def fill_frame_no_cut(
+    source_array,
+    target_width,
+    target_height,
+    max_distortion=None,
+):
+    src_h, src_w = source_array.shape[:2]
+
+    target_ratio = target_width / target_height
+    src_ratio = src_w / src_h
+
+    working = source_array
+
+    if max_distortion is not None:
+        allowed_low = target_ratio / (1 + max_distortion)
+        allowed_high = target_ratio * (1 + max_distortion)
+
+        if src_ratio > allowed_high:
+            # too wide -> cut only the extra width
+            working = crop_to_ratio(
+                source_array, allowed_high,
+                CROP_CENTER_X, CROP_CENTER_Y,
+            )
+        elif src_ratio < allowed_low:
+            # too tall -> cut only the extra height
+            working = crop_to_ratio(
+                source_array, allowed_low,
+                CROP_CENTER_X, CROP_CENTER_Y,
+            )
+
+    return resize_and_sharpen(working, target_width, target_height)
+
+
+# ============================================================
+# RESIZE + LIGHT SHARPEN (same quality for every folder)
+# Single resize from the original pixels = best quality.
+# ============================================================
+
+def resize_and_sharpen(array, target_width, target_height):
+    src_h, src_w = array.shape[:2]
+
+    # Shrinking on both sides -> INTER_AREA (cleanest, sharpest)
+    # Otherwise (enlarging)    -> Lanczos (crisp edges)
+    if target_width <= src_w and target_height <= src_h:
+        interpolation = cv2.INTER_AREA
+    else:
+        interpolation = cv2.INTER_LANCZOS4
+
+    resized = cv2.resize(
+        array,
+        (target_width, target_height),
+        interpolation=interpolation,
+    )
+
+    # Very light sharpening (no halos, no color change)
+    blurred = cv2.GaussianBlur(resized, (0, 0), sigmaX=0.8)
+    sharpened = cv2.addWeighted(resized, 1.25, blurred, -0.25, 0)
+    sharpened = np.clip(sharpened, 0, 255).astype(np.uint8)
+
+    if sharpened.shape[:2] != (target_height, target_width):
+        raise RuntimeError("Unexpected output dimensions")
+
+    return Image.fromarray(sharpened)
+
+
+# ============================================================
+# CROP HELPER (only used when max_distortion is set)
+# ============================================================
+
+def crop_to_ratio(array, ratio, center_x=0.5, center_y=0.5):
+    src_h, src_w = array.shape[:2]
+    src_ratio = src_w / src_h
+
+    if src_ratio > ratio:
+        crop_w = int(round(src_h * ratio))
+        crop_h = src_h
+    else:
+        crop_w = src_w
+        crop_h = int(round(src_w / ratio))
+
+    crop_w = max(1, min(crop_w, src_w))
+    crop_h = max(1, min(crop_h, src_h))
+
+    x0 = int(round((src_w - crop_w) * center_x))
+    y0 = int(round((src_h - crop_h) * center_y))
+    x0 = max(0, min(x0, src_w - crop_w))
+    y0 = max(0, min(y0, src_h - crop_h))
+
+    return array[y0:y0 + crop_h, x0:x0 + crop_w]
+
+
+# ============================================================
+# ENCODE JPEG -- HIGH QUALITY, NO SIZE LIMIT
+# ============================================================
+
+def encode_jpeg(image, icc_profile=None):
+    buffer = io.BytesIO()
+
+    options = {
+        "format": "JPEG",
+        "quality": JPEG_QUALITY,
+        "subsampling": 0,       # 4:4:4 full color detail
+        "optimize": True,
+        "progressive": True,
+    }
+
+    if icc_profile:
+        options["icc_profile"] = icc_profile
+
+    image.save(buffer, **options)
+    return buffer.getvalue()
+
+
+# ============================================================
+# CONVERT TO RGB
+# ============================================================
+
+def convert_to_rgb(image):
+    if image.mode == "RGB":
+        return image
+
+    if "A" in image.getbands() or image.mode == "P":
+        rgba = image.convert("RGBA")
+        background = Image.new("RGBA", rgba.size, (255, 255, 255, 255))
+        return Image.alpha_composite(background, rgba).convert("RGB")
+
+    return image.convert("RGB")
+
+
+# ============================================================
+# LIMIT EXTREMELY LARGE SOURCE IMAGES
+# ============================================================
+
+def limit_source_dimensions(image):
+    width, height = image.size
+
+    if width <= MAX_SOURCE_WIDTH and height <= MAX_SOURCE_HEIGHT:
+        return image
+
+    scale = min(MAX_SOURCE_WIDTH / width, MAX_SOURCE_HEIGHT / height)
+    new_size = (max(1, int(width * scale)), max(1, int(height * scale)))
+
+    logger.info("Limiting source: %s x %s -> %s x %s",
+                width, height, new_size[0], new_size[1])
+
+    return image.resize(new_size, Image.Resampling.LANCZOS)
+
+
+# ============================================================
+# BACKFILL EXISTING ORIGINAL IMAGES
+# Test event: {"mode": "backfill"}
+# ============================================================
+
+def backfill_existing_images():
+    logger.info("Starting backfill for %s", INPUT_PREFIX)
+
+    results = []
+    paginator = s3.get_paginator("list_objects_v2")
+
+    for page in paginator.paginate(Bucket=BUCKET_NAME, Prefix=INPUT_PREFIX):
+        for obj in page.get("Contents", []):
+            key = obj["Key"]
+
+            if key.endswith("/"):
+                continue
+
+            try:
+                head = s3.head_object(Bucket=BUCKET_NAME, Key=key)
+                metadata = head.get("Metadata", {})
+
+                if metadata.get(PROCESSED_METADATA_KEY) == PROCESSED_METADATA_VALUE:
+                    results.append({"input": key, "status": "already_processed"})
+                    continue
+
+                results.append(process_image(BUCKET_NAME, key))
+
+            except Exception as exc:
+                logger.exception("Failed to process %s", key)
+                results.append({"input": key, "status": "failed",
+                                "error": str(exc)})
+
+    logger.info("Backfill finished: %s objects inspected", len(results))
+    return results
